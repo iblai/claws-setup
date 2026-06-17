@@ -51,7 +51,7 @@ DUMMY_CLAW_SERVER_URL = "https://claw.example.com"
 DUMMY_CLAW_GATEWAY_TOKEN = "dummy-gateway-token-change-me"
 DUMMY_CLAW_TYPE = "openclaw"  # "openclaw" | "ironclaw"
 
-DUMMY_AGENT_ID = "main"  # empty → derived from mentor name slug
+DUMMY_AGENT_ID = ""  # empty → derived from mentor name slug
 DUMMY_AGENT_CONFIG = {}  # dict of agent config fields, e.g. {"identity": "...", "soul": "..."}
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -76,7 +76,6 @@ def create_claw_instance(
     claw_type: str = "openclaw",
 ) -> dict:
     """POST /orgs/{org}/claw/instances/ — returns the created ClawInstance JSON."""
-    print("Create Claw Instance")
     url = f"{host}/api/ai-mentor/orgs/{tenant_key}/claw/instances/"
     payload = {
         "name": name,
@@ -401,7 +400,7 @@ def main() -> int:
     session = requests.Session()
     session.headers.update(
         {
-            "Authorization": f"Api-Token {args.api_key}",
+            "Authorization": f"Token {args.api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
