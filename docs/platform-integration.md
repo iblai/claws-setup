@@ -193,6 +193,12 @@ Content-Type: application/json
 
 This automatically creates an `AgentConfig` for the mentor if one doesn't exist.
 
+> [!NOTE]
+> **The push creates the worker agent for you.** Pushing a mentor's config provisions the target agent
+> automatically (ensure-on-push), so binding to a non-default agent name needs no host-side step. To
+> pre-create a standalone agent by hand: `openclaw agents add <name>` (OpenClaw, over SSH) or
+> `nemoclaw <sandbox> exec --no-tty -- openclaw agents add <name>` (NemoClaw).
+
 **Response (201 Created):**
 
 ```json

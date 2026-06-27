@@ -13,7 +13,7 @@ NemoClaw is NVIDIA's turnkey distribution of OpenClaw. A vanilla OpenClaw instal
 Practical consequences for the setup:
 
 - The gateway runs **inside** the sandbox, not directly on the host. An `openshell` port-forward exposes it to the host's network namespace.
-- You operate three CLIs: `nemoclaw` (orchestrator), `openshell` (sandbox + forwards), `openclaw` (inside the sandbox -- reached via `openshell exec`).
+- You operate three CLIs: `nemoclaw` (orchestrator), `openshell` (sandbox + forwards), `openclaw` (inside the sandbox -- reached via `nemoclaw <sandbox> connect` interactively, or `nemoclaw <sandbox> exec --no-tty -- <cmd>` for a single scripted command).
 - By default the onboarding wizard binds the host-side forward to `127.0.0.1:18789`, which is fine for Caddy on the same host -- but the Control UI origin allowlist is baked at onboard time, so the hostname you plan to serve from must be known before `nemoclaw onboard` runs.
 - Hardware requirements are higher than OpenClaw: **8 GB RAM minimum, 16 GB recommended; 20 GB disk minimum, 40 GB recommended; 4+ vCPU.**
 
@@ -296,14 +296,19 @@ After the rebuild completes, verify the allowlist as above.
 
 ### Entering the sandbox for diagnostics
 
-To inspect OpenClaw config or run `openclaw` commands against the running sandbox, drop into the sandbox shell:
+There are two ways to run `openclaw` commands against the running sandbox:
 
 ```bash
+# Interactive shell (openclaw, openclaw config get, etc. are on PATH):
 nemoclaw <sandbox-name> connect
-# You are now inside the sandbox. `openclaw`, `openclaw config get`, etc. are on PATH.
+
+# Single scripted command (non-interactive -- use this for automation):
+nemoclaw <sandbox-name> exec --no-tty -- openclaw devices list
+nemoclaw <sandbox-name> exec --no-tty -- openclaw config get gateway.controlUi.allowedOrigins
 ```
 
-There is **no** `openshell exec <sandbox> -- <cmd>` form in NemoClaw -- use `nemoclaw <sandbox-name> connect` and run commands interactively. `/sandbox/.openclaw/openclaw.json` is root-owned and read-only by design, so do not try to edit it directly; always flow config through `CHAT_UI_URL` and `nemoclaw onboard` / `rebuild`.
+There is no `openshell exec <sandbox> -- <cmd>` form; use the `nemoclaw <sandbox> exec` form above.
+`/sandbox/.openclaw/openclaw.json` is root-owned and read-only by design, so do not try to edit it directly; always flow config through `CHAT_UI_URL` and `nemoclaw onboard` / `rebuild`.
 
 ---
 
@@ -321,16 +326,45 @@ curl -s -o /dev/null -w "%{http_code}" https://domain.example.com/api/status
 # Expected: 200
 ```
 
-### 5.2 -- Control UI
+> [!TIP]
+> **Getting a 502 through Caddy, or the host check isn't 200?** The gateway forward port is not always
+> `18789` -- onboarding picks the next free port (often `18790`) if `18789` is taken, so the Caddyfile's
+> `reverse_proxy` target can point at a port nothing is listening on. Confirm the live port with
+> `nemoclaw <sandbox-name> dashboard-url` and make the `reverse_proxy` target in your Caddyfile match it,
+> then `systemctl reload caddy`.
 
-Open `https://domain.example.com/?token=<gateway-token>` in a browser. First access through Caddy will show "pairing required" (same as OpenClaw -- reverse-proxied connections are not auto-approved). Approve from inside the sandbox:
+### 5.2 -- Control UI and first-admin pairing
+
+Open `https://domain.example.com/?token=<gateway-token>` in a browser. Through Caddy this first access shows **"pairing required"** -- reverse-proxied connections are not auto-approved.
+
+> [!IMPORTANT]
+> **On NemoClaw, `openclaw devices approve` from the CLI cannot bootstrap the first admin.** Approving a
+> device requires `operator.admin` scope; the gateway token grants only `operator.pairing`; upgrading to
+> admin needs an already-approved admin, and none exists yet. Do not trust the CLI here: depending on
+> version it either retries indefinitely (appears to hang) or prints `Approved` via a host-local fallback
+> while the resulting device binding still fails to authenticate. NemoClaw also does not auto-approve
+> loopback the way plain OpenClaw does. Use the dashboard bootstrap below instead.
+
+Bootstrap the first admin through the **dashboard on a loopback origin**, which is granted admin without
+device pairing (the control path runs with device auth disabled). The key is that the browser origin must be
+`127.0.0.1`, not the public domain, so tunnel the sandbox's internal dashboard port:
 
 ```bash
-nemoclaw <sandbox-name> connect
-# Inside the sandbox:
-openclaw devices list
-openclaw devices approve <requestId>
+# Get the exact loopback dashboard URL (token embedded):
+nemoclaw <sandbox-name> dashboard-url
+
+# From your machine, tunnel the sandbox dashboard port to localhost:
+ssh -L 18790:127.0.0.1:18790 root@<server-ip>
+# then open in your browser (note 127.0.0.1, NOT the public domain):
+#   http://127.0.0.1:18790/?token=<gateway-token>
 ```
+
+In the dashboard, find the pending device request and approve it with a click. Confirm it actually took:
+reload the dashboard (the device moves to **Paired**), or watch the gateway log for a successful connect
+rather than another `pairing required` / `token_mismatch` -- the approval is not done until a real
+connection authenticates. Once one admin device is approved, later pairings can be approved normally. This
+same loopback-dashboard step is how you approve the **ibl.ai platform's** device in
+[Part 6](#part-6-connect-to-iblai).
 
 ### 5.3 -- Chat test
 
@@ -350,6 +384,43 @@ The platform-side integration is identical for NemoClaw and OpenClaw -- the gate
 - [OpenClaw Part 5.4 -- Test chat through the platform](server-setup.md#54----test-chat-through-the-platform)
 
 One gotcha: when the ibl.ai backend pushes config via the gateway, the changes are applied to the OpenClaw instance **inside the sandbox**. To inspect the effective config, drop in with `nemoclaw <sandbox-name> connect` and run `openclaw config get` -- the `~/.openclaw/openclaw.json` on the host is not the live config.
+
+Two NemoClaw-specific differences from the OpenClaw flow:
+
+- **Pairing the platform device uses the dashboard bootstrap, not the CLI.** `openclaw devices approve`
+  cannot approve the platform's device, for the same reason it cannot bootstrap a browser admin (no
+  pre-existing admin to approve from). After the platform's first config push mints a pending device
+  request, approve it through the loopback dashboard (see [Step 5.2](#52----control-ui-and-first-admin-pairing)).
+  One approval covers all mentors on the instance.
+- **The gateway token regenerates on every rebuild.** `nemoclaw <sandbox> rebuild` / recreate mints a fresh
+  `gateway.auth.token`. The token stored in the ibl.ai instance's `gateway_token` no longer matches, so
+  every connect fails with a token-mismatch handshake error until you re-read the new token
+  (`nemoclaw <sandbox> exec --no-tty -- openclaw config get gateway.auth.token`) and update the instance via
+  the platform API. This is separate from, and in addition to, re-pairing the device.
+
+---
+
+## Multi-Agent Setup (Optional)
+
+To run multiple agents on one NemoClaw sandbox (e.g. tutor, course-creator, admissions), add them with
+`openclaw agents add` inside the sandbox. Use the scriptable `exec` form, or do it interactively via
+`connect`:
+
+```bash
+nemoclaw <sandbox-name> exec --no-tty -- openclaw agents add tutor-agent
+nemoclaw <sandbox-name> exec --no-tty -- openclaw agents add course-creator-agent
+# or interactively:
+#   nemoclaw <sandbox-name> connect
+#   openclaw agents add tutor-agent
+```
+
+> [!NOTE]
+> **You don't need this for mentors.** When the platform pushes a mentor's config it creates the target
+> worker agent automatically (ensure-on-push), so binding a mentor to a non-default agent name needs no
+> host-side step. Use `openclaw agents add` only to pre-create standalone agents you manage by hand.
+
+Each agent gets its own workspace and agent directory inside the sandbox, and appears in `agents.list`.
+More agents means more concurrent LLM calls; consider model fallbacks if you run several.
 
 ---
 
@@ -407,7 +478,12 @@ nemoclaw <sandbox-name> restart
 
 Avoid `npm update -g openclaw` directly -- NemoClaw manages the OpenClaw version inside the sandbox and a mismatched manual upgrade can desync the plugin.
 
-**Caution:** sandbox recreation **wipes paired devices** and **resets the openshell forward**. After a major NemoClaw upgrade, re-run the systemd forward service and re-approve the ibl.ai platform's device identity. See [OpenClaw -- Device Re-Pairing](server-setup.md#device-re-pairing-after-gateway-restarts--updates) for the procedure.
+**Caution:** sandbox recreation **wipes paired devices**, **regenerates the gateway token**, and **resets the openshell forward**. After a major NemoClaw upgrade: re-run the systemd forward service; re-read the new gateway token and re-sync it into the ibl.ai instance's `gateway_token`; and re-approve the platform's device via the loopback dashboard ([Step 5.2](#52----control-ui-and-first-admin-pairing)). See [OpenClaw -- Device Re-Pairing](server-setup.md#device-re-pairing-after-gateway-restarts--updates) for the device-identity background.
+
+> [!NOTE]
+> The OpenClaw version inside the sandbox is **pinned by the NemoClaw release** (NemoClaw ships matched
+> compatibility patches for a specific OpenClaw version). You cannot bump OpenClaw independently with
+> `npm update -g openclaw`; track the OpenClaw version NemoClaw provides via `nemoclaw update`.
 
 ---
 
@@ -420,8 +496,10 @@ Avoid `npm update -g openclaw` directly -- NemoClaw manages the OpenClaw version
 | 3   | Forward is lost after reboot                                                                                     | systemd unit not installed for the forward                                                                                                      | Install `nemoclaw-forward.service`. See [Step 1.6](#16----persistence-across-reboots)                                                                              |
 | 4   | Host-side `~/.openclaw/openclaw.json` edits have no effect                                                       | That file is on the host; the live config lives inside the sandbox. The sandbox config is also read-only                                        | Use `nemoclaw <sandbox> connect` and `openclaw config get` to inspect. Change origins by re-exporting `CHAT_UI_URL` and running `nemoclaw <sandbox> rebuild --yes` |
 | 5   | `missing scope: operator.read` on platform config push                                                           | Same as OpenClaw -- device identity signing not wired up                                                                                        | Provision the Ed25519 keypair. See [OpenClaw Part 5.2](server-setup.md#52----generate-and-store-device-keypair)                                                    |
-| 6   | `NOT_PAIRED` after `nemoclaw update`                                                                             | Sandbox recreated, paired devices wiped                                                                                                         | Re-pair. See [OpenClaw -- Device Re-Pairing](server-setup.md#device-re-pairing-after-gateway-restarts--updates)                                                    |
-| 7   | Let's Encrypt ACME fails on Caddy startup                                                                        | DNS / firewall not ready                                                                                                                        | See [OpenClaw Part 3](server-setup.md#part-3-firewall)                                                                                                             |
+| 6   | `NOT_PAIRED` after `nemoclaw update`                                                                             | Sandbox recreated, paired devices wiped                                                                                                         | Re-approve via the loopback dashboard ([Step 5.2](#52----control-ui-and-first-admin-pairing)) -- on NemoClaw the CLI `openclaw devices approve` cannot bootstrap   |
+| 7   | `openclaw devices approve <id>` hangs / retries forever                                                          | CLI uses the device path (only `operator.pairing` scope); approving needs `operator.admin`, which requires an already-approved admin            | Bootstrap the first admin through the loopback dashboard, not the CLI ([Step 5.2](#52----control-ui-and-first-admin-pairing))                                       |
+| 8   | Token-mismatch / handshake failure on platform connect after a rebuild                                          | Rebuild regenerated `gateway.auth.token`; the instance's stored `gateway_token` is now stale                                                    | Re-read `openclaw config get gateway.auth.token` and update the instance's `gateway_token` via the platform API                                                    |
+| 9   | Let's Encrypt ACME fails on Caddy startup                                                                        | DNS / firewall not ready                                                                                                                        | See [OpenClaw Part 3](server-setup.md#part-3-firewall)                                                                                                             |
 
 ---
 
