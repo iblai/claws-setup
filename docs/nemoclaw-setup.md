@@ -395,7 +395,7 @@ Two NemoClaw-specific differences from the OpenClaw flow:
 - **The gateway token regenerates on every rebuild.** `nemoclaw <sandbox> rebuild` / recreate mints a fresh
   `gateway.auth.token`. The token stored in the ibl.ai instance's `gateway_token` no longer matches, so
   every connect fails with a token-mismatch handshake error until you re-read the new token
-  (`nemoclaw <sandbox> exec --no-tty -- openclaw config get gateway.auth.token`) and update the instance via
+  (`nemoclaw <sandbox> gateway-token --quiet`) and update the instance via
   the platform API. This is separate from, and in addition to, re-pairing the device.
 
 ---
@@ -547,7 +547,7 @@ Avoid `npm update -g openclaw` directly. NemoClaw manages the OpenClaw version i
 | 5   | `missing scope: operator.read` on platform config push                                                           | Same as OpenClaw: device identity signing not wired up                                                                                        | Provision the Ed25519 keypair. See [OpenClaw Part 5.2](server-setup.md#52-generate-and-store-device-keypair)                                                    |
 | 6   | `NOT_PAIRED` after `nemoclaw update`                                                                             | Sandbox recreated, paired devices wiped                                                                                                         | Re-approve the platform device: `nemoclaw <sandbox> exec --no-tty -- openclaw devices approve <requestId>` (or the loopback dashboard, [Step 5.2](#52-control-ui-and-first-admin-pairing)) |
 | 7   | `openclaw devices approve` returns `unknown requestId`                                                           | A device id was passed instead of the pending request id                                                                                        | Read the request id from `openclaw devices list` and pass that; the approve completes via the local-loopback fallback                                              |
-| 8   | Token-mismatch / handshake failure on platform connect after a rebuild                                          | Rebuild regenerated `gateway.auth.token`; the instance's stored `gateway_token` is now stale                                                    | Re-read `openclaw config get gateway.auth.token` and update the instance's `gateway_token` via the platform API                                                    |
+| 8   | Token-mismatch / handshake failure on platform connect after a rebuild                                          | Rebuild regenerated `gateway.auth.token`; the instance's stored `gateway_token` is now stale                                                    | Re-read with `nemoclaw <sandbox> gateway-token --quiet` and update the instance's `gateway_token` via the platform API                                                    |
 | 9   | Let's Encrypt ACME fails on Caddy startup                                                                        | DNS / firewall not ready                                                                                                                        | See [OpenClaw Part 3](server-setup.md#part-3-firewall)                                                                                                             |
 
 ---
