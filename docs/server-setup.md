@@ -21,7 +21,7 @@ Student (browser) → ibl.ai Platform (Django Channels / ASGI)
                     LLM Provider (Anthropic, etc.)
 ```
 
-**Why Caddy on the host (not Docker):** Caddy must run directly on the host so that TCP connections to OpenClaw arrive from `127.0.0.1`. This preserves loopback auto-approval for device identity. If Caddy ran in a Docker container, it would connect via Docker bridge (172.x.x.x) and OpenClaw would treat it as a remote connection.
+**Why Caddy on the host (not Docker):** Caddy runs directly on the host so TCP connections to OpenClaw arrive from `127.0.0.1` rather than a Docker bridge address (`172.x.x.x`). This does **not** by itself make the platform backend auto-approve: Caddy adds an `X-Forwarded-For` header with the remote client's IP, which OpenClaw treats as the real client, so the backend device is seen as remote and must be approved once (see [Device Re-Pairing](#device-re-pairing-after-gateway-restarts--updates)).
 
 **Why device identity signing:** On vanilla OpenClaw, the gateway requires Ed25519 device identity in the WebSocket connect handshake. Without it, connections succeed but the gateway grants **zero scopes** -- effectively treating the client as unauthenticated. This is the root cause of "missing scope: operator.read" failures. The platform backend signs each connect with its own Ed25519 keypair.
 
@@ -178,16 +178,17 @@ echo "export ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" >> ~/.bashrc
 # Create workspace directory
 mkdir -p /root/.openclaw/workspace
 
-# Enable lingering so user services survive SSH logout
+# Enable lingering so the user service survives SSH logout
 loginctl enable-linger root
 
-# Start the gateway
-openclaw gateway --port 18789 &
-
-# Or use the onboard wizard just for the systemd service:
-# openclaw onboard --install-daemon
-# (It will detect existing config and skip most prompts)
+# Install the gateway as a user systemd service. It detects the existing config
+# ("Use existing values"), skips most prompts, and installs the unit at
+# ~/.config/systemd/user/openclaw-gateway.service
+openclaw onboard --install-daemon
+systemctl --user start openclaw-gateway
 ```
+
+The rest of this guide manages the gateway through that service (e.g. `systemctl --user restart openclaw-gateway`). For a one-off foreground test you can run `openclaw gateway --port 18789` directly, but that process is **not** the systemd service and dies on SSH logout.
 
 Verify the gateway is running:
 
@@ -195,8 +196,6 @@ Verify the gateway is running:
 curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18789/
 # Expected: 200
 ```
-
-> **Note:** If you want the systemd service auto-created, you can still run `openclaw onboard --install-daemon` -- it will detect the existing config ("Use existing values"), skip most prompts, and just install the service at `~/.config/systemd/user/openclaw-gateway.service`.
 
 > **Why `loginctl enable-linger root`?** OpenClaw installs a **user-level** systemd service. Without lingering, the service dies when the last SSH session closes. The `openclaw onboard --install-daemon` wizard handles this automatically, but if you skip the wizard you must run it yourself. Verify with: `loginctl show-user root 2>/dev/null | grep Linger` -- should show `Linger=yes`. See [Snag #11](#snags-reference) for what happens when this is missed.
 
@@ -349,7 +348,7 @@ Store the private key in the claw instance's `connection_params`:
 
 Set this via the ibl.ai platform API (PATCH the instance's `connection_params` field) or through your admin interface.
 
-**How it works:** `OpenClawClient.connect()` receives a `connect.challenge` from the gateway, signs it with the Ed25519 key using the `v2` payload format (`v2|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce`), and includes the `device` object in the connect params. Fresh keypairs are auto-approved on loopback -- no manual `openclaw devices approve` step needed for backend connections. Each connect signs fresh (no session token caching).
+**How it works:** `OpenClawClient.connect()` receives a `connect.challenge` from the gateway, signs it with the Ed25519 key using the `v2` payload format (`v2|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce`), and includes the `device` object in the connect params. Only same-host loopback connections are auto-approved; the platform backend connects remotely through Caddy, so the first push mints a pending pairing request you approve once with `openclaw devices approve <requestId>` (see [Step 5.3](#53----push-config) and [Device Re-Pairing](#device-re-pairing-after-gateway-restarts--updates)). Each connect signs fresh (no session token caching).
 
 ### 5.3 -- Push config
 
@@ -422,7 +421,7 @@ journalctl -u caddy -f
 
 | Log pattern | Meaning |
 |---|---|
-| `protocol 3` | WebSocket handshake succeeded |
+| `protocol 4` (the negotiated version; older builds logged `protocol 3`) | WebSocket handshake succeeded |
 | `chat.send` | Chat request sent to LLM provider |
 | `error` / `ECONNREFUSED` | Anthropic API call failed (key issue, rate limit, outage) |
 | `close 4008` | WebSocket proxy issue |
@@ -497,32 +496,9 @@ openclaw devices approve <requestId>
 
 The design intent was that Caddy (on the same host) proxies to OpenClaw at `localhost:18789`, so connections arrive from `127.0.0.1` and are auto-approved. However, Caddy adds `X-Forwarded-For` headers with the remote client's IP, and OpenClaw uses those to determine the "real" client IP. Since the platform backend connects from a remote server, OpenClaw sees a non-loopback IP and requires manual approval.
 
-### Solution options (for review and automation phase)
+### Reducing manual re-pairing
 
-The goal is a **robust, non-fragile solution** so that gateway restarts and OpenClaw updates do not require manual re-pairing. The options below are proposed for evaluation -- no implementation is specified here.
-
-#### A. OpenClaw upstream (preferred if feasible)
-
-- **A1. Persist paired devices across restarts and version upgrades** -- OpenClaw stores paired devices in `~/.openclaw/devices.json` (or equivalent) and loads this file on startup.
-- **A2. Config-based trusted device registration** -- `gateway.trustedDevices` or `gateway.trustedDevicePublicKeys` in config, survives restarts because it lives in config.
-- **A3. Admin API for device approval** -- `POST /api/admin/devices/approve` protected by gateway token.
-
-#### B. Platform-side automation
-
-- **B1. Health check detects NOT_PAIRED and alerts** -- WebSocket connect attempt in health check, notify admins on failure.
-- **B2. Admin action: "Trigger re-pair"** -- triggers connect attempt and shows the requestId.
-- **B3. Automated re-pair via agent on OpenClaw host** -- a small service that auto-approves known devices.
-
-#### C. Infrastructure / deployment
-
-- **C1. Backup and restore `devices.json`** -- backup before update, restore after.
-- **C2. External persistence (e.g. R2 / S3)** -- persist device state externally.
-
-#### D. Reverse-proxy behavior (Caddy)
-
-- **D1. Strip forwarded headers so OpenClaw sees loopback** -- Caddy strips `X-Forwarded-For` and `X-Real-Ip`. OpenClaw sees `127.0.0.1` and auto-approves. Tradeoff: no real client IP in gateway logs.
-
-**Recommendation:** Pursue **A1** and/or **A2** with the OpenClaw project so device pairing survives restarts by design. Short term, manual re-pair plus **B1** (detect and alert) reduces silent outage.
+Making pairing survive restarts and updates is a known gap. The durable fixes are upstream: persisting paired devices across restarts, or config-based trusted-device registration. On the platform side, a health check that detects `NOT_PAIRED` and alerts keeps a wiped pairing from becoming a silent outage. One reverse-proxy workaround is to have Caddy strip `X-Forwarded-For` so OpenClaw sees loopback and auto-approves, at the cost of losing the real client IP in the gateway logs.
 
 ### Device identity scope
 
