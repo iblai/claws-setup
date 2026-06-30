@@ -2,7 +2,7 @@
 
 Connect your claw server to ibl.ai and manage it through the platform's APIs and applications.
 
-Once connected, your claw instance is accessible from all ibl.ai applications -- Mentor AI, Skills AI, and any custom integration using the REST API. You register the server, bind mentors, configure agent identities and skills, and push configuration -- all through the same API that powers the ibl.ai platform UI.
+Once connected, your claw instance is accessible from all ibl.ai applications: Mentor AI, Skills AI, and any custom integration using the REST API. You register the server, bind mentors, configure agent identities and skills, and push configuration. It all runs through the same API that powers the ibl.ai platform UI.
 
 ---
 
@@ -43,11 +43,11 @@ Content-Type: application/json
 | Field | Type | Description |
 |---|---|---|
 | `name` | string | Display name for this instance |
-| `claw_type` | string | Instance type (e.g. `"openclaw"`) |
+| `claw_type` | string | Instance type. Use `"openclaw"` for a standard OpenClaw worker. NemoClaw workers also work with `"openclaw"`. A dedicated `"nemoclaw"` type is available on recent platform versions for NemoClaw-specific handling; use it where supported. |
 | `server_url` | string | HTTPS URL of your claw server |
-| `gateway_token` | string | Write-only. The token from [server setup step 1.3](server-setup.md#13----generate-a-gateway-token) |
+| `gateway_token` | string | Write-only. The token from [server setup step 1.3](server-setup.md#13-generate-a-gateway-token) |
 | `auth_headers` | object | Write-only. Optional proxy auth headers (`{"string": "string"}` pairs) |
-| `connection_params` | object | Write-only. Variant-specific auth (e.g. device identity key for OpenClaw -- see below) |
+| `connection_params` | object | Write-only. Variant-specific auth (e.g. device identity key for OpenClaw, see below) |
 
 **Device identity (required for OpenClaw):** The platform needs an Ed25519 keypair for device identity signing. Without it, config push will fail with "missing scope: operator.read". Generate a keypair and include it in `connection_params`:
 
@@ -59,9 +59,9 @@ Content-Type: application/json
 }
 ```
 
-See [server setup step 5.2](server-setup.md#52----generate-and-store-device-keypair) for how to generate the keypair.
+See [server setup step 5.2](server-setup.md#52-generate-and-store-device-keypair) for how to generate the keypair.
 
-Save the `id` from the response -- you'll need it for subsequent steps.
+Save the `id` from the response. You'll need it for subsequent steps.
 
 **Response (201 Created):**
 
@@ -127,7 +127,7 @@ If `health_check` fails: check that the OpenClaw gateway is running (`systemctl 
 
 ## Part 2: Configure and Call from ibl.ai
 
-Once your server is registered, you manage everything through the ibl.ai API. This means all ibl.ai applications -- Mentor AI chat, Skills AI, custom integrations -- can use your claw instance. Configuration, agent identities, skills, and model providers are all pushed from the platform to your server.
+Once your server is registered, you manage everything through the ibl.ai API. This means all ibl.ai applications can use your claw instance: Mentor AI chat, Skills AI, and custom integrations. Configuration, agent identities, skills, and model providers are all pushed from the platform to your server.
 
 ### Set up a model provider (optional)
 
@@ -228,6 +228,9 @@ This automatically creates an `AgentConfig` for the mentor if one doesn't exist.
 
 Agent configuration defines the workspace files and settings that get pushed to the claw instance. Each text field maps to a markdown file in the agent's workspace:
 
+> [!IMPORTANT]
+> A claw-backed mentor does not inherit the mentor's platform `system_prompt`. The claw agent is driven entirely by the agent-config fields below (`identity`, `soul`, and the rest), and that config starts empty when you bind the mentor. Enter the persona and behavior here, or the agent runs with no instructions.
+
 ```http
 PATCH /api/ai-mentor/orgs/<your-org>/agent-configs/<id>/
 Content-Type: application/json
@@ -241,14 +244,14 @@ Content-Type: application/json
 
 | Field | Type | Pushed as | Description |
 |---|---|---|---|
-| `identity` | text | IDENTITY.md | Agent persona -- name, visual description, vibe |
-| `soul` | text | SOUL.md | Behavioral guidelines -- personality, values, boundaries |
+| `identity` | text | IDENTITY.md | Agent persona: name, visual description, vibe |
+| `soul` | text | SOUL.md | Behavioral guidelines: personality, values, boundaries |
 | `user_context` | text | USER.md | User-specific environment details |
 | `tools` | text | TOOLS.md | Environment-specific reference notes for tool usage |
 | `agents` | text | AGENTS.md | Multi-agent routing configuration |
 | `bootstrap` | text | BOOTSTRAP.md | One-time first-run instructions (consumed after use) |
 | `heartbeat` | text | HEARTBEAT.md | Periodic awareness checklist content |
-| `memory` | text | MEMORY.md | Seed memory -- long-term curated facts |
+| `memory` | text | MEMORY.md | Seed memory: long-term curated facts |
 | `model` | string | config.patch | LLM model identifier |
 | `config` | JSON | config.patch | Instance settings (heartbeat schedule, session isolation, skill toggles) |
 
@@ -276,15 +279,20 @@ The first time the platform pushes config, the instance may require device pairi
 
 1. SSH into your server
 2. Run: `openclaw devices list`
-3. Find the pending request and approve it: `openclaw devices approve <requestId>`
+3. Find the pending request and approve it: `openclaw devices approve <requestId> --token "$OPENCLAW_GATEWAY_TOKEN"`
 
-This only needs to be done once per platform connection. See [Device Re-Pairing](server-setup.md#device-re-pairing) if pairing is lost after updates.
+For a NemoClaw worker, approve from inside the sandbox instead with `nemoclaw <sandbox> exec --no-tty -- openclaw devices approve <requestId>`.
+
+This only needs to be done once per platform connection. See [Device Re-Pairing](server-setup.md#device-re-pairing-after-gateway-restarts--updates) if pairing is lost after updates.
 
 ---
 
 ## Skills Management
 
 Skills are reusable capabilities that can be assigned to mentors. When config is pushed, enabled skill assignments are sent to the instance.
+
+> [!NOTE]
+> Skills push without any extra setup on the worker. Installing the optional `iblai-openclaw-extensions` plugin adds per-agent isolation and clean removal of unassigned skills. Without it, skills install worker-wide and unassigned skills are disabled rather than deleted. See [OpenClaw plugin setup](server-setup.md#optional-iblai-extensions-plugin-per-agent-skills) or [NemoClaw plugin setup](nemoclaw-setup.md#optional-iblai-extensions-plugin-per-agent-skills).
 
 ### Create a skill
 
@@ -316,7 +324,7 @@ Content-Type: application/json
 
 ### Add resources to a skill
 
-Skills can have attached files -- scripts, references, or binary assets:
+Skills can have attached files: scripts, references, or binary assets.
 
 **For scripts and references (text content):**
 
@@ -438,7 +446,7 @@ curl -X POST https://platform.ibl.ai/api/ai-mentor/orgs/my-org/claw/mentor-confi
 # SSH into your claw server
 ssh root@claw.mycompany.com
 openclaw devices list
-openclaw devices approve <requestId>
+openclaw devices approve <requestId> --token "$OPENCLAW_GATEWAY_TOKEN"
 ```
 
 ### 7. Chat
