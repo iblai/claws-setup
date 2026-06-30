@@ -349,13 +349,15 @@ If you prefer the dashboard, the browser origin must be `127.0.0.1`, not the pub
 sandbox's internal dashboard port:
 
 ```bash
-# Get the exact loopback dashboard URL (token embedded):
+# Get the exact loopback dashboard URL (it embeds the token and the real port):
 nemoclaw <sandbox-name> dashboard-url
+# e.g. http://127.0.0.1:18789/?token=...   The port matches your gateway forward:
+# 18789 by default, or whatever onboarding chose if 18789 was already taken.
 
-# From your machine, tunnel the sandbox dashboard port to localhost:
-ssh -L 18790:127.0.0.1:18790 root@<server-ip>
+# From your machine, tunnel that same port to localhost (substitute <dashboard-port>):
+ssh -L <dashboard-port>:127.0.0.1:<dashboard-port> root@<server-ip>
 # then open in your browser (note 127.0.0.1, NOT the public domain):
-#   http://127.0.0.1:18790/?token=<gateway-token>
+#   http://127.0.0.1:<dashboard-port>/?token=<gateway-token>
 ```
 
 In the dashboard, find the pending device request and approve it with a click. Confirm it actually took:
@@ -428,48 +430,69 @@ More agents means more concurrent LLM calls; consider model fallbacks if you run
 
 The `iblai-openclaw-extensions` plugin adds per-agent skill upload and removal RPCs that the platform uses when it pushes skills. It is optional. Without it, skills still push, but they install worker-wide through the gateway's native upload, and a skill that is later unassigned can only be disabled, not removed. With the plugin, each agent gets its own isolated skill set and unassigned skills are removed cleanly.
 
-On NemoClaw the gateway runs inside an isolated sandbox. The plugin has to be built, made reachable inside the sandbox, then installed into the sandbox at runtime. Install it into the sandbox **workspace** rather than baking the install into the image. A workspace install survives a `nemoclaw rebuild` because the workspace is backed up and restored, whereas a Dockerfile-baked install is overwritten by that same restore.
+On NemoClaw the gateway runs inside an isolated sandbox, so installing the plugin means getting the built plugin into the sandbox and registering it with the in-sandbox OpenClaw. Two methods follow. **Option A (runtime install)** is verified end to end on a live worker: it produces a tracked install and never re-provisions the gateway (no token regeneration), so it is the recommended path. **Option B (bake into a custom image)** is NVIDIA's documented path, but on the version tested here it did not reliably bring the gateway up (see the caveat under Option B).
 
-### Install the plugin
+First build the plugin bundle (both methods need it). It ships TypeScript source:
 
-1. Build the bundle on the host. The plugin ships TypeScript source, so you build `dist/index.mjs`:
+```bash
+git clone https://github.com/iblai/iblai-openclaw-extensions-plugin.git iblai-openclaw-extensions
+cd iblai-openclaw-extensions && npm install -g pnpm && pnpm install && pnpm build && cd ..
+```
 
-   ```bash
-   git clone https://github.com/iblai/iblai-openclaw-extensions-plugin.git
-   cd iblai-openclaw-extensions-plugin
-   npm install -g pnpm
-   pnpm install && pnpm build
-   ```
+You now have `./iblai-openclaw-extensions/` (built, with `dist/index.mjs`).
 
-2. Stage the built plugin where the sandbox can read it. The sandbox filesystem is isolated, so place the plugin (its `dist/` and `openclaw.plugin.json`, without `node_modules`) in the blueprint's plugins directory, which the sandbox image exposes at `/usr/local/share/nemoclaw/openclaw-plugins/`:
+### Option A: install at runtime (verified end to end)
 
-   ```bash
-   PLUGIN_DIR=~/.nemoclaw/source/nemoclaw-blueprint/openclaw-plugins/iblai-openclaw-extensions
-   mkdir -p "$PLUGIN_DIR"
-   cp -a dist openclaw.plugin.json "$PLUGIN_DIR"/
-   chmod -R a+rX "$PLUGIN_DIR"
-   nemoclaw <sandbox-name> rebuild --yes   # carries the files into the sandbox image
-   ```
+Copy the **whole** plugin into the running sandbox and install it from inside. Copy the full plugin (`dist/`, `package.json`, `openclaw.plugin.json`), not just `dist`, or OpenClaw cannot classify it and the install fails with `HOOK.md missing`. First remove `node_modules` from the clone: it is not needed at runtime (the plugin runs from the bundled `dist/index.mjs`) and can carry a self-referential symlink that the sandbox state-backup audit rejects. The removal path is anchored to the clone directory, so it cannot affect anything else even if you run it from the wrong place:
 
-   Do not copy `node_modules`. An outward `node_modules/openclaw` symlink trips the sandbox state-backup audit and breaks snapshots.
+```bash
+SB=<sandbox-name>
+CT=$(docker ps --format '{{.Names}}' | grep "openshell-$SB" | head -1)
 
-3. Install it into the workspace at runtime, then enable it and restart:
+# Anchored to the clone path on purpose: this can only ever delete
+# iblai-openclaw-extensions/node_modules, never a node_modules elsewhere.
+rm -rf ./iblai-openclaw-extensions/node_modules
 
-   ```bash
-   nemoclaw <sandbox-name> exec --no-tty -- openclaw plugins install /usr/local/share/nemoclaw/openclaw-plugins/iblai-openclaw-extensions
-   nemoclaw <sandbox-name> exec --no-tty -- openclaw plugins enable iblai-openclaw-extensions
-   nemoclaw <sandbox-name> restart
-   ```
+docker exec "$CT" rm -rf /tmp/iblai-openclaw-extensions          # idempotent re-runs
+docker cp ./iblai-openclaw-extensions "$CT":/tmp/iblai-openclaw-extensions
+docker exec "$CT" chmod -R a+rX /tmp/iblai-openclaw-extensions
+nemoclaw "$SB" exec --no-tty -- openclaw plugins install /tmp/iblai-openclaw-extensions
+nemoclaw "$SB" exec --no-tty -- openclaw plugins enable iblai-openclaw-extensions
+nemoclaw "$SB" restart
+```
 
-4. Verify it loaded:
+Verify it loaded:
 
-   ```bash
-   nemoclaw <sandbox-name> exec --no-tty -- openclaw plugins inspect iblai-openclaw-extensions
-   # Status: loaded
-   ```
+```bash
+nemoclaw "$SB" exec --no-tty -- openclaw plugins inspect iblai-openclaw-extensions
+# Status: loaded   (with a recorded install path, so it is tracked)
+```
+
+This installs the plugin as a tracked extension. The `restart` reloads the gateway to pick up the plugin, but the gateway token and config are untouched (no re-provision), so there is no "Missing config" risk and no token to re-sync.
+
+### Option B: bake into a custom image (NVIDIA's documented path)
+
+NVIDIA documents baking the plugin into a custom sandbox image and onboarding from it. Put a Dockerfile next to the built plugin directory:
+
+```dockerfile
+# ./Dockerfile  (build context = this directory, which holds iblai-openclaw-extensions/)
+FROM ghcr.io/nvidia/nemoclaw/sandbox-base:latest
+COPY iblai-openclaw-extensions/ /sandbox/.openclaw/extensions/iblai-openclaw-extensions/
+RUN openclaw doctor --fix
+```
+
+```bash
+nemoclaw onboard --from ./Dockerfile --name <sandbox-name>
+```
+
+The Dockerfile above copies the already-built plugin into `/sandbox/.openclaw/extensions/` and runs `openclaw doctor --fix`. NVIDIA also documents a build-in-image variant (COPY the source, build it in the image, then copy the output into the same path); both are the same idea.
+
+**Validate this carefully on your host before relying on it.** On the NemoClaw version tested here, `onboard --from` did **not** reliably bring the gateway up. The plugin loaded, but the gateway sometimes started without a config and logged `Missing config. Run openclaw setup or set gateway.mode=local`, with the onboard reporting `could not read the gateway token (download failed)`. A plain onboard on the same host is healthy, so the failure is specific to the custom-image path, and it was not consistent across attempts (a plain onboard always worked; the bake sometimes did, sometimes did not). The exact trigger was not isolated. Before trusting a `--from` sandbox, confirm **both** that `openclaw plugins inspect` shows the plugin **and** that the gateway responds (`curl` the forward port, expect `200`). If the gateway does not come up, recover with `nemoclaw <sandbox-name> destroy --yes` plus a plain onboard, then use Option A.
+
+`nemoclaw <sandbox-name> rebuild` needs the provider credential in the environment (e.g. `export ANTHROPIC_API_KEY=...`) for its non-interactive recreate.
 
 > [!NOTE]
-> **Persistence and caveats.** The install lives in the sandbox workspace (`~/.openclaw/extensions/`), so it survives a `nemoclaw rebuild` and stays loaded. After a rebuild it loads as "untracked local code" (a provenance warning), because the rebuild resets the install record even though the files persist; pin trust with `plugins.allow` to make it tracked. A full fresh `nemoclaw onboard` does not preserve it, and `nemoclaw update` re-pulls the blueprint clone (re-stage step 2 after an update). The durable long-term home is an ibl.ai-owned blueprint that ships the plugin. A rebuild also regenerates the gateway token, so re-sync the new token into the ibl.ai instance (see [Part 6](#part-6-connect-to-iblai)) afterward.
+> **Persistence.** Either way the plugin lives in the sandbox workspace (`~/.openclaw/extensions/`), so it survives `nemoclaw restart` and `nemoclaw rebuild`. After a `rebuild` it loads "untracked" (the rebuild resets the install record even though the files persist); re-run Option A, or pin with `plugins.allow`. A plain fresh `nemoclaw onboard` (without `--from`) does not preserve it. A `rebuild` also regenerates the gateway token (re-sync it into the ibl.ai instance, [Part 6](#part-6-connect-to-iblai)).
 
 ---
 
@@ -533,6 +556,18 @@ Avoid `npm update -g openclaw` directly. NemoClaw manages the OpenClaw version i
 > The OpenClaw version inside the sandbox is **pinned by the NemoClaw release** (NemoClaw ships matched
 > compatibility patches for a specific OpenClaw version). You cannot bump OpenClaw independently with
 > `npm update -g openclaw`; track the OpenClaw version NemoClaw provides via `nemoclaw update`.
+
+---
+
+## Uninstall
+
+To remove NemoClaw and its host-side resources, use the built-in uninstaller:
+
+```bash
+nemoclaw uninstall --yes
+```
+
+This removes the sandboxes, the `openshell` binaries, `~/.nemoclaw`, and the NemoClaw Docker images. Add `--delete-models` to also drop NemoClaw-pulled Ollama models, or `--keep-openshell` to leave the `openshell` binary in place. It does not touch a separately-installed plain OpenClaw, Caddy, or Docker. To drop a single sandbox without uninstalling everything, use `nemoclaw <sandbox-name> destroy --yes`.
 
 ---
 
