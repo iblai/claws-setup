@@ -559,18 +559,6 @@ Avoid `npm update -g openclaw` directly. NemoClaw manages the OpenClaw version i
 
 ---
 
-## Uninstall
-
-To remove NemoClaw and its host-side resources, use the built-in uninstaller:
-
-```bash
-nemoclaw uninstall --yes
-```
-
-This removes the sandboxes, the `openshell` binaries, `~/.nemoclaw`, and the NemoClaw Docker images. Add `--delete-models` to also drop NemoClaw-pulled Ollama models, or `--keep-openshell` to leave the `openshell` binary in place. It does not touch a separately-installed plain OpenClaw, Caddy, or Docker. To drop a single sandbox without uninstalling everything, use `nemoclaw <sandbox-name> destroy --yes`.
-
----
-
 ## Snags Reference
 
 | #   | Issue                                                                                                            | Root cause                                                                                                                                      | Fix                                                                                                                                                                |
